@@ -132,6 +132,10 @@ fn parse_create_table(input: &str) -> Result<Statement> {
             } else if tokens[t].eq_ignore_ascii_case("UNIQUE") {
                 constraints.push(ColumnConstraint::Unique);
                 t += 1;
+            } else if tokens[t].eq_ignore_ascii_case("REFERENCES") {
+                let (reference, consumed) = parse_references_spec(&tokens[t + 1..])?;
+                constraints.push(reference);
+                t += 1 + consumed;
             } else {
                 return Err(FluxError::Parse(format!(
                     "unknown constraint '{}' in column definition",
@@ -151,6 +155,33 @@ fn parse_create_table(input: &str) -> Result<Statement> {
         name: table_name,
         columns,
     })
+}
+
+fn parse_references_spec(tokens: &[&str]) -> Result<(ColumnConstraint, usize)> {
+    let mut spec = String::new();
+    let mut consumed = 0usize;
+    for token in tokens {
+        spec.push_str(token);
+        consumed += 1;
+        if spec.contains(')') {
+            break;
+        }
+    }
+    let open = spec.find('(');
+    let close = spec.rfind(')');
+    let (Some(open), Some(close)) = (open, close) else {
+        return Err(FluxError::Parse(
+            "REFERENCES requires 'table(column)'".to_string(),
+        ));
+    };
+    if close <= open || !spec[close + 1..].trim().is_empty() {
+        return Err(FluxError::Parse(
+            "REFERENCES requires 'table(column)'".to_string(),
+        ));
+    }
+    let table = normalize_identifier(spec[..open].trim())?;
+    let column = normalize_identifier(spec[open + 1..close].trim())?;
+    Ok((ColumnConstraint::References { table, column }, consumed))
 }
 
 fn parse_create_index(input: &str) -> Result<Statement> {
@@ -293,6 +324,10 @@ fn parse_alter_add_column(table: String, definition: &str) -> Result<Statement> 
         } else if tokens[t].eq_ignore_ascii_case("UNIQUE") {
             constraints.push(ColumnConstraint::Unique);
             t += 1;
+        } else if tokens[t].eq_ignore_ascii_case("REFERENCES") {
+            let (reference, consumed) = parse_references_spec(&tokens[t + 1..])?;
+            constraints.push(reference);
+            t += 1 + consumed;
         } else {
             return Err(FluxError::Parse(format!(
                 "unknown constraint '{}' in ADD COLUMN",
@@ -437,69 +472,106 @@ fn parse_select(input: &str) -> Result<Statement> {
 
     let mut remaining = after_from;
 
-    let join = if let Some(join_idx) = find_keyword_outside_quotes(remaining, "JOIN") {
-        let actual_start =
-            if let Some(inner_idx) = find_keyword_outside_quotes(&remaining[..join_idx], "INNER") {
-                inner_idx
-            } else {
-                join_idx
-            };
-        let table_raw = remaining[..actual_start].trim();
-        let table = normalize_identifier(table_raw)?;
-        let after_join = remaining[join_idx + "JOIN".len()..].trim();
+    let from_end = find_first_keyword(
+        remaining,
+        &["WHERE", "GROUP BY", "ORDER BY", "LIMIT", "OFFSET"],
+    )
+    .unwrap_or(remaining.len());
+    let from_part = remaining[..from_end].trim();
+    remaining = remaining[from_end..].trim();
 
-        let on_idx = find_keyword_outside_quotes(after_join, "ON")
-            .ok_or_else(|| FluxError::Parse("JOIN requires ON clause".to_string()))?;
-        let join_table = normalize_identifier(after_join[..on_idx].trim())?;
-        let on_part = after_join[on_idx + "ON".len()..].trim();
+    let mut joins = Vec::new();
+    let table = if let Some(first_join) = find_keyword_outside_quotes(from_part, "JOIN") {
+        let before = &from_part[..first_join];
+        let base_end = find_keyword_outside_quotes(before, "INNER").unwrap_or(before.len());
+        let table = normalize_identifier(before[..base_end].trim())?;
 
-        let on_end = find_first_keyword(on_part, &["WHERE", "ORDER", "LIMIT", "OFFSET"])
-            .unwrap_or(on_part.len());
-        let on_condition = on_part[..on_end].trim();
-        remaining = on_part[on_end..].trim();
+        let mut cursor = from_part[first_join + "JOIN".len()..].trim();
+        loop {
+            let seg_end =
+                find_first_keyword(cursor, &["INNER", "JOIN"]).unwrap_or(cursor.len());
+            let segment = cursor[..seg_end].trim();
 
-        let eq_idx = find_char_outside_quotes(on_condition, '=')?;
-        let left_col = parse_qualified_column(on_condition[..eq_idx].trim())?;
-        let right_col = parse_qualified_column(on_condition[eq_idx + 1..].trim())?;
+            let on_idx = find_keyword_outside_quotes(segment, "ON")
+                .ok_or_else(|| FluxError::Parse("JOIN requires ON clause".to_string()))?;
+            let join_table = normalize_identifier(segment[..on_idx].trim())?;
+            let on_condition = segment[on_idx + "ON".len()..].trim();
 
-        let (left_column, right_column) = if left_col.0.as_deref() == Some(&*table)
-            || right_col.0.as_deref() == Some(&*join_table)
-        {
-            (left_col.1, right_col.1)
-        } else {
-            (right_col.1, left_col.1)
-        };
+            let eq_idx = find_char_outside_quotes(on_condition, '=')?;
+            let left_col = parse_qualified_column(on_condition[..eq_idx].trim())?;
+            let right_col = parse_qualified_column(on_condition[eq_idx + 1..].trim())?;
 
-        Some((
-            table,
-            JoinClause {
+            let (left_table, left_column, right_column) =
+                if left_col.0.as_deref() == Some(&*join_table) {
+                    (right_col.0, right_col.1, left_col.1)
+                } else {
+                    (left_col.0, left_col.1, right_col.1)
+                };
+
+            joins.push(JoinClause {
                 table: join_table,
+                left_table,
                 left_column,
                 right_column,
-            },
-        ))
-    } else {
-        None
-    };
+            });
 
-    let (table, join_clause) = if let Some((t, j)) = join {
-        (t, Some(j))
+            let next = cursor[seg_end..].trim_start();
+            if next.is_empty() {
+                break;
+            }
+            let next = strip_prefix_ci(next, "INNER")
+                .map(str::trim_start)
+                .unwrap_or(next);
+            cursor = strip_prefix_ci(next, "JOIN")
+                .ok_or_else(|| FluxError::Parse("expected JOIN clause".to_string()))?
+                .trim_start();
+        }
+        table
     } else {
-        let table_end =
-            find_first_keyword(remaining, &["WHERE", "ORDER", "LIMIT", "OFFSET"])
-                .unwrap_or(remaining.len());
-        let table = normalize_identifier(remaining[..table_end].trim())?;
-        remaining = remaining[table_end..].trim();
-        (table, None)
+        normalize_identifier(from_part)?
     };
 
     let filter = if let Some(where_idx) = find_keyword_outside_quotes(remaining, "WHERE") {
         let after_where = remaining[where_idx + "WHERE".len()..].trim();
-        let where_end = find_first_keyword(after_where, &["ORDER", "LIMIT", "OFFSET"])
-            .unwrap_or(after_where.len());
+        let where_end =
+            find_first_keyword(after_where, &["GROUP BY", "ORDER BY", "LIMIT", "OFFSET"])
+                .unwrap_or(after_where.len());
         let filter_str = after_where[..where_end].trim();
         remaining = after_where[where_end..].trim();
         Some(parse_filter(filter_str)?)
+    } else {
+        None
+    };
+
+    let group_by = if let Some(group_idx) = find_keyword_outside_quotes(remaining, "GROUP BY") {
+        let after_group = remaining[group_idx + "GROUP BY".len()..].trim();
+        let group_end =
+            find_first_keyword(after_group, &["HAVING", "ORDER BY", "LIMIT", "OFFSET"])
+                .unwrap_or(after_group.len());
+        let group_str = after_group[..group_end].trim();
+        remaining = after_group[group_end..].trim();
+        let columns = split_comma_aware(group_str)?
+            .into_iter()
+            .map(|c| normalize_identifier(&c))
+            .collect::<Result<Vec<_>>>()?;
+        if columns.is_empty() {
+            return Err(FluxError::Parse("empty GROUP BY clause".to_string()));
+        }
+        columns
+    } else {
+        Vec::new()
+    };
+
+    let having = if let Some(having_idx) = find_keyword_outside_quotes(remaining, "HAVING") {
+        let after_having = remaining[having_idx + "HAVING".len()..].trim();
+        let having_end = find_first_keyword(after_having, &["ORDER BY", "LIMIT", "OFFSET"])
+            .unwrap_or(after_having.len());
+        let having_str = after_having[..having_end].trim();
+        remaining = after_having[having_end..].trim();
+        if group_by.is_empty() {
+            return Err(FluxError::Parse("HAVING requires GROUP BY".to_string()));
+        }
+        Some(parse_having(having_str)?)
     } else {
         None
     };
@@ -546,8 +618,10 @@ fn parse_select(input: &str) -> Result<Statement> {
     Ok(Statement::Select {
         table,
         columns,
-        join: join_clause,
+        joins,
         filter,
+        group_by,
+        having,
         order_by,
         limit,
         offset,
@@ -690,39 +764,58 @@ fn parse_delete(input: &str) -> Result<Statement> {
 }
 
 fn parse_filter(input: &str) -> Result<FilterExpr> {
-    parse_or_expr(input.trim())
+    parse_or_expr(input.trim(), parse_comparison_expr)
 }
 
-fn parse_or_expr(input: &str) -> Result<FilterExpr> {
+fn parse_having(input: &str) -> Result<FilterExpr> {
+    parse_or_expr(input.trim(), parse_having_comparison)
+}
+
+type LeafParser = fn(&str) -> Result<FilterExpr>;
+
+fn parse_or_expr(input: &str, leaf: LeafParser) -> Result<FilterExpr> {
     let parts = split_by_keyword_aware(input, "OR")?;
     if parts.len() <= 1 {
-        return parse_and_expr(input);
+        return parse_and_expr(input, leaf);
     }
     let mut iter = parts.into_iter();
     let first = iter
         .next()
         .ok_or_else(|| FluxError::Parse("empty OR expression".to_string()))?;
-    let mut expr = parse_and_expr(&first)?;
+    let mut expr = parse_and_expr(&first, leaf)?;
     for part in iter {
-        expr = FilterExpr::Or(Box::new(expr), Box::new(parse_and_expr(&part)?));
+        expr = FilterExpr::Or(Box::new(expr), Box::new(parse_and_expr(&part, leaf)?));
     }
     Ok(expr)
 }
 
-fn parse_and_expr(input: &str) -> Result<FilterExpr> {
+fn parse_and_expr(input: &str, leaf: LeafParser) -> Result<FilterExpr> {
     let parts = split_by_keyword_aware(input, "AND")?;
     if parts.len() <= 1 {
-        return parse_comparison_expr(input);
+        return leaf(input);
     }
     let mut iter = parts.into_iter();
     let first = iter
         .next()
         .ok_or_else(|| FluxError::Parse("empty AND expression".to_string()))?;
-    let mut expr = parse_comparison_expr(&first)?;
+    let mut expr = leaf(&first)?;
     for part in iter {
-        expr = FilterExpr::And(Box::new(expr), Box::new(parse_comparison_expr(&part)?));
+        expr = FilterExpr::And(Box::new(expr), Box::new(leaf(&part)?));
     }
     Ok(expr)
+}
+
+fn parse_having_comparison(input: &str) -> Result<FilterExpr> {
+    let trimmed = input.trim();
+    let (idx, op_len, op) = find_comparison_operator(trimmed)?;
+    let lhs = trimmed[..idx].trim();
+    let column = if let Some(SelectExpr::Aggregate { func, target }) = try_parse_aggregate(lhs)? {
+        crate::ast::aggregate_label(&func, &target)
+    } else {
+        normalize_identifier(lhs)?
+    };
+    let value = parse_literal(trimmed[idx + op_len..].trim())?;
+    Ok(FilterExpr::Compare { column, op, value })
 }
 
 fn parse_comparison_expr(input: &str) -> Result<FilterExpr> {
@@ -751,6 +844,46 @@ fn parse_comparison_expr(input: &str) -> Result<FilterExpr> {
             )));
         }
         return Ok(FilterExpr::IsNull { column });
+    }
+
+    let not_in_idx = find_keyword_outside_quotes(trimmed, "NOT IN");
+    let in_idx = find_keyword_outside_quotes(trimmed, "IN");
+    let in_spec = match (not_in_idx, in_idx) {
+        (Some(idx), _) => Some((idx, "NOT IN".len(), true)),
+        (None, Some(idx)) => Some((idx, "IN".len(), false)),
+        (None, None) => None,
+    };
+    if let Some((idx, kw_len, negated)) = in_spec {
+        let column = normalize_identifier(trimmed[..idx].trim())?;
+        let rhs = trimmed[idx + kw_len..].trim();
+        if !rhs.starts_with('(') || !rhs.ends_with(')') {
+            return Err(FluxError::Parse(
+                "IN requires a parenthesized value list or subquery".to_string(),
+            ));
+        }
+        let inner = rhs[1..rhs.len() - 1].trim();
+        if strip_prefix_ci(inner, "SELECT").is_some() {
+            let subquery = parse_select(inner)?;
+            return Ok(FilterExpr::InSubquery {
+                column,
+                subquery: Box::new(subquery),
+                negated,
+            });
+        }
+        let values = split_comma_aware(inner)?
+            .into_iter()
+            .map(|token| parse_literal(&token))
+            .collect::<Result<Vec<_>>>()?;
+        if values.is_empty() {
+            return Err(FluxError::Parse(
+                "IN requires at least one value".to_string(),
+            ));
+        }
+        return Ok(FilterExpr::InList {
+            column,
+            values,
+            negated,
+        });
     }
 
     if let Some(like_idx) = find_keyword_outside_quotes(trimmed, "LIKE") {
@@ -1006,6 +1139,7 @@ fn find_keyword_outside_quotes(input: &str, keyword: &str) -> Option<usize> {
     let mut i = 0usize;
     let mut in_single = false;
     let mut in_double = false;
+    let mut paren_depth = 0i32;
 
     while i < bytes.len() {
         let b = bytes[i];
@@ -1028,8 +1162,17 @@ fn find_keyword_outside_quotes(input: &str, keyword: &str) -> Option<usize> {
             continue;
         }
 
+        if !in_single && !in_double {
+            if b == b'(' {
+                paren_depth += 1;
+            } else if b == b')' {
+                paren_depth -= 1;
+            }
+        }
+
         if !in_single
             && !in_double
+            && paren_depth == 0
             && i + key.len() <= bytes.len()
             && bytes[i..i + key.len()].eq_ignore_ascii_case(key)
         {
@@ -1345,7 +1488,7 @@ mod tests {
         .expect("parse");
         let Statement::Select {
             table,
-            join,
+            joins,
             filter,
             ..
         } = statement
@@ -1353,10 +1496,83 @@ mod tests {
             panic!("expected select");
         };
         assert_eq!(table, "users");
-        let join = join.unwrap();
-        assert_eq!(join.table, "orders");
-        assert_eq!(join.left_column, "id");
-        assert_eq!(join.right_column, "user_id");
+        assert_eq!(joins.len(), 1);
+        assert_eq!(joins[0].table, "orders");
+        assert_eq!(joins[0].left_column, "id");
+        assert_eq!(joins[0].right_column, "user_id");
         assert!(filter.is_some());
+    }
+
+    #[test]
+    fn parses_multi_join() {
+        let statement = parse_statement(
+            "SELECT name FROM users JOIN orders ON users.id = orders.user_id \
+             JOIN items ON orders.id = items.order_id",
+        )
+        .expect("parse");
+        let Statement::Select { joins, .. } = statement else {
+            panic!("expected select");
+        };
+        assert_eq!(joins.len(), 2);
+        assert_eq!(joins[1].table, "items");
+    }
+
+    #[test]
+    fn parses_group_by_having() {
+        let statement = parse_statement(
+            "SELECT user_id, COUNT(*) FROM orders GROUP BY user_id HAVING COUNT(*) > 1",
+        )
+        .expect("parse");
+        let Statement::Select {
+            group_by, having, ..
+        } = statement
+        else {
+            panic!("expected select");
+        };
+        assert_eq!(group_by, vec!["user_id".to_string()]);
+        assert!(matches!(
+            having,
+            Some(FilterExpr::Compare { column, .. }) if column == "COUNT(*)"
+        ));
+    }
+
+    #[test]
+    fn parses_in_list_and_subquery() {
+        let statement =
+            parse_statement("SELECT * FROM users WHERE id IN (1, 2, 3)").expect("parse");
+        let Statement::Select { filter, .. } = statement else {
+            panic!("expected select");
+        };
+        assert!(matches!(
+            filter,
+            Some(FilterExpr::InList { ref values, negated: false, .. }) if values.len() == 3
+        ));
+
+        let statement = parse_statement(
+            "SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM banned WHERE active = true)",
+        )
+        .expect("parse");
+        let Statement::Select { filter, .. } = statement else {
+            panic!("expected select");
+        };
+        assert!(matches!(
+            filter,
+            Some(FilterExpr::InSubquery { negated: true, .. })
+        ));
+    }
+
+    #[test]
+    fn parses_references_constraint() {
+        let statement = parse_statement(
+            "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT REFERENCES users(id))",
+        )
+        .expect("parse");
+        let Statement::CreateTable { columns, .. } = statement else {
+            panic!("expected create table");
+        };
+        assert!(columns[1].constraints.iter().any(|c| matches!(
+            c,
+            ColumnConstraint::References { table, column } if table == "users" && column == "id"
+        )));
     }
 }

@@ -10,9 +10,10 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const PBKDF2_ROUNDS: u32 = 210_000;
@@ -269,6 +270,7 @@ struct AuditEntry<'a> {
 
 pub struct AuditLogger {
     path: PathBuf,
+    file: Mutex<Option<File>>,
 }
 
 impl AuditLogger {
@@ -277,6 +279,7 @@ impl AuditLogger {
         fs::create_dir_all(&security_dir)?;
         Ok(Self {
             path: security_dir.join("audit.log"),
+            file: Mutex::new(None),
         })
     }
 
@@ -299,11 +302,23 @@ impl AuditLogger {
             success,
             message,
         };
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        writeln!(file, "{}", serde_json::to_string(&entry)?)?;
+        let line = serde_json::to_string(&entry)?;
+        let mut guard = self
+            .file
+            .lock()
+            .map_err(|_| FluxError::Configuration("audit log lock poisoned".to_string()))?;
+        if guard.is_none() {
+            *guard = Some(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)?,
+            );
+        }
+        let file = guard
+            .as_mut()
+            .ok_or_else(|| FluxError::Configuration("audit log unavailable".to_string()))?;
+        writeln!(file, "{line}")?;
         Ok(())
     }
 }

@@ -5,6 +5,7 @@ pub enum ColumnConstraint {
     PrimaryKey,
     NotNull,
     Unique,
+    References { table: String, column: String },
 }
 
 #[derive(Debug, Clone)]
@@ -27,6 +28,25 @@ pub enum AggregateFunc {
 pub enum AggregateTarget {
     Star,
     Column(String),
+}
+
+impl AggregateFunc {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Count => "COUNT",
+            Self::Sum => "SUM",
+            Self::Min => "MIN",
+            Self::Max => "MAX",
+            Self::Avg => "AVG",
+        }
+    }
+}
+
+pub fn aggregate_label(func: &AggregateFunc, target: &AggregateTarget) -> String {
+    match target {
+        AggregateTarget::Star => format!("{}(*)", func.name()),
+        AggregateTarget::Column(column) => format!("{}({})", func.name(), column),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +83,16 @@ pub enum FilterExpr {
     IsNotNull {
         column: String,
     },
+    InList {
+        column: String,
+        values: Vec<Value>,
+        negated: bool,
+    },
+    InSubquery {
+        column: String,
+        subquery: Box<Statement>,
+        negated: bool,
+    },
     And(Box<FilterExpr>, Box<FilterExpr>),
     Or(Box<FilterExpr>, Box<FilterExpr>),
 }
@@ -82,6 +112,7 @@ pub struct OrderByClause {
 #[derive(Debug, Clone)]
 pub struct JoinClause {
     pub table: String,
+    pub left_table: Option<String>,
     pub left_column: String,
     pub right_column: String,
 }
@@ -130,8 +161,10 @@ pub enum Statement {
     Select {
         table: String,
         columns: Vec<SelectExpr>,
-        join: Option<JoinClause>,
+        joins: Vec<JoinClause>,
         filter: Option<FilterExpr>,
+        group_by: Vec<String>,
+        having: Option<FilterExpr>,
         order_by: Vec<OrderByClause>,
         limit: Option<usize>,
         offset: Option<usize>,

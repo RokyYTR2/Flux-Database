@@ -1,12 +1,12 @@
 use crate::error::{FluxError, Result};
 use crate::security::CryptoManager;
 use crate::types::{
-    Catalog, ColumnSchema, IndexCatalog, IndexDefinition, MigrationRecord, Row, StoredRow,
-    TableSchema, Value,
+    Catalog, ColumnSchema, IndexCatalog, IndexDefinition, MigrationRecord, Row, RowLocator,
+    StoredRow, TableSchema, Value,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,8 +16,16 @@ pub struct Storage {
     crypto: CryptoManager,
     migrations: Vec<MigrationRecord>,
     index_catalog: IndexCatalog,
+    index_maps: BTreeMap<String, BTreeMap<String, Vec<RowLocator>>>,
+    row_id_cursors: BTreeMap<String, (u64, u64)>,
+    table_files: BTreeMap<String, File>,
+    unique_caches: BTreeMap<String, BTreeMap<String, HashSet<String>>>,
+    dirty_indexes: HashSet<String>,
+    indexes_clean: bool,
     txn_dir: Option<PathBuf>,
 }
+
+const ROW_ID_BATCH: u64 = 256;
 
 impl Storage {
     pub fn open(root: impl AsRef<Path>, crypto: CryptoManager) -> Result<Self> {
@@ -38,16 +46,123 @@ impl Storage {
             let _ = fs::remove_dir_all(&txn_path);
         }
 
-        Ok(Self {
+        let mut storage = Self {
             root,
             catalog,
             crypto,
             migrations,
             index_catalog,
+            index_maps: BTreeMap::new(),
+            row_id_cursors: BTreeMap::new(),
+            table_files: BTreeMap::new(),
+            unique_caches: BTreeMap::new(),
+            dirty_indexes: HashSet::new(),
+            indexes_clean: false,
             txn_dir: None,
-        })
+        };
+
+        let marker = storage.index_marker_path();
+        if marker.exists() {
+            fs::remove_file(&marker)?;
+            storage.load_all_index_maps()?;
+        } else {
+            storage.rebuild_all_indexes()?;
+        }
+        Ok(storage)
     }
 
+    pub fn flush_indexes(&mut self) -> Result<()> {
+        for name in std::mem::take(&mut self.dirty_indexes) {
+            if let Some(map) = self.index_maps.get(&name) {
+                save_encrypted_json(&self.index_path(&name), &self.crypto, map)?;
+            }
+        }
+        File::create(self.index_marker_path())?;
+        self.indexes_clean = true;
+        Ok(())
+    }
+
+    fn rebuild_all_indexes(&mut self) -> Result<()> {
+        self.index_maps.clear();
+        let names: Vec<String> = self
+            .index_catalog
+            .indexes
+            .iter()
+            .map(|idx| idx.name.clone())
+            .collect();
+        for name in names {
+            self.rebuild_index(&name)?;
+        }
+        Ok(())
+    }
+
+    fn close_table_file(&mut self, table: &str) {
+        self.table_files.remove(table);
+    }
+
+    pub fn unique_value_exists(
+        &mut self,
+        table: &str,
+        column: &str,
+        value: &Value,
+    ) -> Result<bool> {
+        let key = index_value_key(value)?;
+        if let Some(set) = self
+            .unique_caches
+            .get(table)
+            .and_then(|columns| columns.get(column))
+        {
+            return Ok(set.contains(&key));
+        }
+
+        let mut set = HashSet::new();
+        for stored in self.read_stored_rows(table)? {
+            if let Some(existing) = stored.data.get(column) {
+                if !matches!(existing, Value::Null) {
+                    set.insert(index_value_key(existing)?);
+                }
+            }
+        }
+        let found = set.contains(&key);
+        self.unique_caches
+            .entry(table.to_string())
+            .or_default()
+            .insert(column.to_string(), set);
+        Ok(found)
+    }
+
+    fn note_unique_values(&mut self, table: &str, row: &Row) -> Result<()> {
+        let Some(columns) = self.unique_caches.get_mut(table) else {
+            return Ok(());
+        };
+        for (column, set) in columns.iter_mut() {
+            if let Some(value) = row.get(column) {
+                if !matches!(value, Value::Null) {
+                    set.insert(index_value_key(value)?);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn invalidate_unique_cache(&mut self, table: &str) {
+        self.unique_caches.remove(table);
+    }
+
+    fn load_all_index_maps(&mut self) -> Result<()> {
+        self.index_maps.clear();
+        let names: Vec<String> = self
+            .index_catalog
+            .indexes
+            .iter()
+            .map(|idx| idx.name.clone())
+            .collect();
+        for name in names {
+            let map = self.load_index_map_from_disk(&name)?;
+            self.index_maps.insert(name, map);
+        }
+        Ok(())
+    }
 
     pub fn begin_transaction(&mut self) -> Result<()> {
         if self.txn_dir.is_some() {
@@ -55,6 +170,9 @@ impl Storage {
                 "transaction already in progress".to_string(),
             ));
         }
+
+        self.table_files.clear();
+        self.flush_indexes()?;
 
         let txn_path = self.root.join(".txn_snapshot");
         if txn_path.exists() {
@@ -102,6 +220,9 @@ impl Storage {
             ));
         }
 
+        self.table_files.clear();
+        self.unique_caches.clear();
+
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
             let name_str = entry.file_name().to_string_lossy().to_string();
@@ -134,10 +255,12 @@ impl Storage {
             &self.crypto,
             IndexCatalog::default(),
         )?;
+        self.dirty_indexes.clear();
+        self.load_all_index_maps()?;
+        self.row_id_cursors.clear();
 
         Ok(())
     }
-
 
     pub fn create_table(&mut self, schema: TableSchema) -> Result<()> {
         if self.catalog.tables.contains_key(&schema.name) {
@@ -147,6 +270,7 @@ impl Storage {
         self.catalog
             .tables
             .insert(schema.name.clone(), schema.clone());
+        self.close_table_file(&schema.name);
         File::create(self.table_path(&schema.name))?;
         self.save_catalog()?;
 
@@ -188,18 +312,23 @@ impl Storage {
             if path.exists() {
                 fs::remove_file(path)?;
             }
+            self.index_maps.remove(idx_name);
+            self.dirty_indexes.remove(idx_name);
         }
         self.index_catalog
             .indexes
             .retain(|idx| idx.table_name != table);
         self.save_index_catalog()?;
 
+        self.close_table_file(table);
+        self.invalidate_unique_cache(table);
         let table_path = self.table_path(table);
         if table_path.exists() {
             fs::remove_file(table_path)?;
         }
 
         self.catalog.tables.remove(table);
+        self.row_id_cursors.remove(table);
         self.save_catalog()?;
         self.record_migration(table, "DROP_TABLE", &format!("DROP TABLE {table}"))?;
         Ok(())
@@ -269,6 +398,8 @@ impl Storage {
         if path.exists() {
             fs::remove_file(path)?;
         }
+        self.index_maps.remove(index_name);
+        self.dirty_indexes.remove(index_name);
 
         self.index_catalog
             .indexes
@@ -282,12 +413,12 @@ impl Storage {
         Ok(table)
     }
 
-    pub fn find_indexed_row_ids(
+    pub fn find_indexed_locators(
         &self,
         table: &str,
         column: &str,
         value: &Value,
-    ) -> Result<Option<Vec<u64>>> {
+    ) -> Result<Option<Vec<RowLocator>>> {
         let Some(index) = self
             .index_catalog
             .indexes
@@ -297,8 +428,12 @@ impl Storage {
             return Ok(None);
         };
 
-        let map = self.read_index_map(&index.name)?;
-        Ok(map.get(&index_value_key(value)?).cloned())
+        let Some(map) = self.index_maps.get(&index.name) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            map.get(&index_value_key(value)?).cloned().unwrap_or_default(),
+        ))
     }
 
     pub fn add_column(
@@ -377,6 +512,8 @@ impl Storage {
             if path.exists() {
                 fs::remove_file(path)?;
             }
+            self.index_maps.remove(idx_name);
+            self.dirty_indexes.remove(idx_name);
         }
         if !to_remove.is_empty() {
             self.index_catalog
@@ -467,18 +604,34 @@ impl Storage {
             .ok_or_else(|| FluxError::TableNotFound(table.to_string()))
     }
 
-    pub fn append_row(&mut self, table: &str, row: &Row) -> Result<()> {
-        let row_id = {
+    fn allocate_row_id(&mut self, table: &str) -> Result<u64> {
+        if let Some((next, limit)) = self.row_id_cursors.get_mut(table) {
+            if *next < *limit {
+                let id = *next;
+                *next += 1;
+                return Ok(id);
+            }
+        }
+
+        let batch_start = {
             let schema = self
                 .catalog
                 .tables
                 .get_mut(table)
                 .ok_or_else(|| FluxError::TableNotFound(table.to_string()))?;
-            let id = schema.next_row_id;
-            schema.next_row_id += 1;
-            id
+            let start = schema.next_row_id;
+            schema.next_row_id = start + ROW_ID_BATCH;
+            start
         };
         self.save_catalog()?;
+
+        self.row_id_cursors
+            .insert(table.to_string(), (batch_start + 1, batch_start + ROW_ID_BATCH));
+        Ok(batch_start)
+    }
+
+    pub fn append_row(&mut self, table: &str, row: &Row) -> Result<()> {
+        let row_id = self.allocate_row_id(table)?;
 
         let stored = StoredRow {
             id: row_id,
@@ -487,11 +640,22 @@ impl Storage {
         let payload = serde_json::to_vec(&stored)?;
         let encrypted = self.crypto.encrypt_to_base64(&payload)?;
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.table_path(table))?;
+        let path = self.table_path(table);
+        let file = match self.table_files.get_mut(table) {
+            Some(file) => file,
+            None => {
+                let file = OpenOptions::new().create(true).append(true).open(&path)?;
+                self.table_files.entry(table.to_string()).or_insert(file)
+            }
+        };
+        let offset = file.metadata()?.len();
         writeln!(file, "{encrypted}")?;
+
+        let locator = RowLocator {
+            id: row_id,
+            offset,
+            len: encrypted.len() as u32,
+        };
 
         let index_names: Vec<(String, String)> = self
             .index_catalog
@@ -502,10 +666,13 @@ impl Storage {
             .collect();
         for (index_name, column_name) in index_names {
             let value = row.get(&column_name).cloned().unwrap_or(Value::Null);
-            let mut map = self.read_index_map(&index_name)?;
-            map.entry(index_value_key(&value)?).or_default().push(row_id);
-            self.write_index_map(&index_name, &map)?;
+            let mut map = self.index_maps.remove(&index_name).unwrap_or_default();
+            map.entry(index_value_key(&value)?)
+                .or_default()
+                .push(locator);
+            self.write_index_map(&index_name, map)?;
         }
+        self.note_unique_values(table, row)?;
         Ok(())
     }
 
@@ -517,20 +684,67 @@ impl Storage {
             .collect())
     }
 
-    pub fn read_rows_filtered(&self, table: &str, row_ids: Option<&[u64]>) -> Result<Vec<Row>> {
-        let Some(wanted) = row_ids else {
+    pub fn read_rows_filtered(
+        &self,
+        table: &str,
+        locators: Option<&[RowLocator]>,
+    ) -> Result<Vec<Row>> {
+        let Some(wanted) = locators else {
             return self.read_rows(table);
         };
-        let wanted: std::collections::HashSet<u64> = wanted.iter().copied().collect();
-        Ok(self
-            .read_stored_rows(table)?
-            .into_iter()
-            .filter(|stored| wanted.contains(&stored.id))
-            .map(|stored| stored.data)
-            .collect())
+        match self.read_rows_at(table, wanted) {
+            Ok(rows) => Ok(rows),
+            Err(_) => {
+                let wanted_ids: std::collections::HashSet<u64> =
+                    wanted.iter().map(|loc| loc.id).collect();
+                Ok(self
+                    .read_stored_rows(table)?
+                    .into_iter()
+                    .filter(|stored| wanted_ids.contains(&stored.id))
+                    .map(|stored| stored.data)
+                    .collect())
+            }
+        }
+    }
+
+    fn read_rows_at(&self, table: &str, locators: &[RowLocator]) -> Result<Vec<Row>> {
+        if !self.catalog.tables.contains_key(table) {
+            return Err(FluxError::TableNotFound(table.to_string()));
+        }
+        let table_path = self.table_path(table);
+        if !table_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut file = File::open(table_path)?;
+        let mut rows = Vec::with_capacity(locators.len());
+        let mut buf = Vec::new();
+        for locator in locators {
+            file.seek(SeekFrom::Start(locator.offset))?;
+            buf.resize(locator.len as usize, 0);
+            file.read_exact(&mut buf)?;
+            let encrypted_line = String::from_utf8(buf.clone())?;
+            let decrypted = self.crypto.decrypt_from_base64(&encrypted_line)?;
+            let stored = serde_json::from_slice::<StoredRow>(&decrypted)?;
+            if stored.id != locator.id {
+                return Err(FluxError::Configuration(
+                    "index locator does not match stored row".to_string(),
+                ));
+            }
+            rows.push(stored.data);
+        }
+        Ok(rows)
     }
 
     fn read_stored_rows(&self, table: &str) -> Result<Vec<StoredRow>> {
+        Ok(self
+            .read_stored_rows_located(table)?
+            .into_iter()
+            .map(|(_, stored)| stored)
+            .collect())
+    }
+
+    fn read_stored_rows_located(&self, table: &str) -> Result<Vec<(RowLocator, StoredRow)>> {
         if !self.catalog.tables.contains_key(table) {
             return Err(FluxError::TableNotFound(table.to_string()));
         }
@@ -541,15 +755,31 @@ impl Storage {
         }
 
         let file = File::open(table_path)?;
-        let reader = BufReader::new(file);
+        let mut reader = BufReader::new(file);
         let mut rows = Vec::new();
-        for line in reader.lines() {
-            let encrypted_line = line?;
-            if encrypted_line.trim().is_empty() {
-                continue;
+        let mut offset: u64 = 0;
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            let consumed = reader.read_line(&mut line)?;
+            if consumed == 0 {
+                break;
             }
-            let decrypted = self.crypto.decrypt_from_base64(&encrypted_line)?;
-            rows.push(serde_json::from_slice::<StoredRow>(&decrypted)?);
+            let encrypted_line = line.trim_end_matches(['\n', '\r']);
+            if !encrypted_line.trim().is_empty() {
+                let decrypted = self.crypto.decrypt_from_base64(encrypted_line)?;
+                let stored = serde_json::from_slice::<StoredRow>(&decrypted)?;
+                rows.push((
+                    RowLocator {
+                        id: stored.id,
+                        offset,
+                        len: encrypted_line.len() as u32,
+                    },
+                    stored,
+                ));
+            }
+            offset += consumed as u64;
         }
         Ok(rows)
     }
@@ -561,6 +791,8 @@ impl Storage {
         if !self.catalog.tables.contains_key(table) {
             return Err(FluxError::TableNotFound(table.to_string()));
         }
+        self.close_table_file(table);
+        self.invalidate_unique_cache(table);
         let input_path = self.table_path(table);
         let tmp_path = self.table_path(&format!("{table}.tmp_rewrite"));
 
@@ -605,6 +837,8 @@ impl Storage {
             return Err(FluxError::TableNotFound(table.to_string()));
         }
 
+        self.close_table_file(table);
+        self.invalidate_unique_cache(table);
         let mut buf = Vec::new();
         for stored in rows {
             let payload = serde_json::to_vec(stored)?;
@@ -639,29 +873,32 @@ impl Storage {
         Ok(())
     }
 
-    fn rebuild_indexes_for_table(&self, table: &str) -> Result<()> {
-        for index in self
+    fn rebuild_indexes_for_table(&mut self, table: &str) -> Result<()> {
+        let names: Vec<String> = self
             .index_catalog
             .indexes
             .iter()
             .filter(|idx| idx.table_name == table)
-        {
-            self.rebuild_index(&index.name)?;
+            .map(|idx| idx.name.clone())
+            .collect();
+        for name in names {
+            self.rebuild_index(&name)?;
         }
         Ok(())
     }
 
-    fn rebuild_index(&self, index_name: &str) -> Result<usize> {
+    fn rebuild_index(&mut self, index_name: &str) -> Result<usize> {
         let index_def = self
             .index_catalog
             .indexes
             .iter()
             .find(|idx| idx.name == index_name)
-            .ok_or_else(|| FluxError::InvalidSchema(format!("index '{index_name}' not found")))?;
+            .ok_or_else(|| FluxError::InvalidSchema(format!("index '{index_name}' not found")))?
+            .clone();
 
-        let rows = self.read_stored_rows(&index_def.table_name)?;
-        let mut map: BTreeMap<String, Vec<u64>> = BTreeMap::new();
-        for stored in &rows {
+        let rows = self.read_stored_rows_located(&index_def.table_name)?;
+        let mut map: BTreeMap<String, Vec<RowLocator>> = BTreeMap::new();
+        for (locator, stored) in &rows {
             let value = stored
                 .data
                 .get(&index_def.column_name)
@@ -669,22 +906,44 @@ impl Storage {
                 .unwrap_or(Value::Null);
             map.entry(index_value_key(&value)?)
                 .or_default()
-                .push(stored.id);
+                .push(*locator);
         }
-        self.write_index_map(index_name, &map)?;
-        Ok(map.len())
+        let key_count = map.len();
+        self.write_index_map(index_name, map)?;
+        Ok(key_count)
     }
 
-    fn read_index_map(&self, index_name: &str) -> Result<BTreeMap<String, Vec<u64>>> {
-        load_encrypted_json(
-            &self.index_path(index_name),
+    fn load_index_map_from_disk(
+        &self,
+        index_name: &str,
+    ) -> Result<BTreeMap<String, Vec<RowLocator>>> {
+        let path = self.index_path(index_name);
+        match load_encrypted_json::<BTreeMap<String, Vec<RowLocator>>>(
+            &path,
             &self.crypto,
-            BTreeMap::<String, Vec<u64>>::new(),
-        )
+            BTreeMap::new(),
+        ) {
+            Ok(map) => Ok(map),
+            Err(FluxError::Serde(_)) => Ok(BTreeMap::new()),
+            Err(err) => Err(err),
+        }
     }
 
-    fn write_index_map(&self, index_name: &str, map: &BTreeMap<String, Vec<u64>>) -> Result<()> {
-        save_encrypted_json(&self.index_path(index_name), &self.crypto, map)
+    fn write_index_map(
+        &mut self,
+        index_name: &str,
+        map: BTreeMap<String, Vec<RowLocator>>,
+    ) -> Result<()> {
+        self.index_maps.insert(index_name.to_string(), map);
+        self.dirty_indexes.insert(index_name.to_string());
+        if self.indexes_clean {
+            let marker = self.index_marker_path();
+            if marker.exists() {
+                fs::remove_file(&marker)?;
+            }
+            self.indexes_clean = false;
+        }
+        Ok(())
     }
 
     fn save_catalog(&self) -> Result<()> {
@@ -721,6 +980,16 @@ impl Storage {
 
     fn index_path(&self, index_name: &str) -> PathBuf {
         self.root.join(format!("index_{index_name}.enc"))
+    }
+
+    fn index_marker_path(&self) -> PathBuf {
+        self.root.join("indexes.clean")
+    }
+}
+
+impl Drop for Storage {
+    fn drop(&mut self) {
+        let _ = self.flush_indexes();
     }
 }
 

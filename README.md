@@ -61,6 +61,7 @@ fluxdb --user admin
 ```sql
 -- Tables
 CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL UNIQUE, active BOOL);
+CREATE TABLE orders (id INT PRIMARY KEY, user_id INT REFERENCES users(id), amount INT);
 DROP TABLE users;
 DESCRIBE users;
 SHOW TABLES;
@@ -73,6 +74,9 @@ SELECT id, name FROM users WHERE active = true;
 SELECT COUNT(*), SUM(id), AVG(id), MIN(id), MAX(id) FROM users;
 SELECT id, name FROM users ORDER BY id DESC LIMIT 10 OFFSET 5;
 SELECT users.id, orders.id FROM users JOIN orders ON users.id = orders.user_id;
+SELECT user_id, COUNT(*) FROM orders GROUP BY user_id HAVING COUNT(*) > 1;
+SELECT name FROM users WHERE id IN (1, 2, 3);
+SELECT name FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount > 20);
 UPDATE users SET name = 'Bob' WHERE id = 1;
 DELETE FROM users WHERE id = 1;
 
@@ -94,15 +98,38 @@ SHOW MIGRATIONS;
 
 ### Column constraints
 
-`PRIMARY KEY`, `NOT NULL`, `UNIQUE` — set at `CREATE TABLE` time.
+`PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `REFERENCES table(column)` — set at `CREATE TABLE` time.
+
+Foreign keys (`REFERENCES`) are enforced with *restrict* semantics: inserting or updating a child value requires a matching parent row, and deleting a parent row, updating its key, or dropping the parent table fails while child rows still reference it.
 
 ### Aggregates
 
-`COUNT(*)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)`.
+`COUNT(*)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)` — standalone or with `GROUP BY ... HAVING`:
+
+```sql
+SELECT user_id, SUM(amount) FROM orders GROUP BY user_id HAVING SUM(amount) > 100;
+```
 
 ### JOIN
 
-Single inner `JOIN ... ON` per query, e.g. `SELECT * FROM users JOIN orders ON users.id = orders.user_id`.
+Inner `JOIN ... ON`, chainable across multiple tables:
+
+```sql
+SELECT name, product FROM users
+  JOIN orders ON users.id = orders.user_id
+  JOIN items ON orders.id = items.order_id;
+```
+
+Duplicate column names from joined tables are prefixed `<table>_` (e.g. `orders_id`).
+
+### Subqueries
+
+`IN` / `NOT IN` accept a literal list or a single-column subquery:
+
+```sql
+SELECT name FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount > 20);
+SELECT name FROM users WHERE id NOT IN (1, 2, 3);
+```
 
 ### ORDER BY / LIMIT / OFFSET
 

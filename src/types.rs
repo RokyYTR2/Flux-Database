@@ -69,6 +69,7 @@ pub enum Constraint {
     PrimaryKey,
     NotNull,
     Unique,
+    References { table: String, column: String },
 }
 
 impl Display for Constraint {
@@ -77,6 +78,7 @@ impl Display for Constraint {
             Self::PrimaryKey => write!(f, "PRIMARY KEY"),
             Self::NotNull => write!(f, "NOT NULL"),
             Self::Unique => write!(f, "UNIQUE"),
+            Self::References { table, column } => write!(f, "REFERENCES {table}({column})"),
         }
     }
 }
@@ -101,6 +103,13 @@ pub struct TableSchema {
 pub struct StoredRow {
     pub id: u64,
     pub data: Row,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RowLocator {
+    pub id: u64,
+    pub offset: u64,
+    pub len: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -1,12 +1,12 @@
 use crate::ast::{
-    AggregateFunc, AggregateTarget, CompareOp, FilterExpr, JoinClause, OrderByClause, SelectExpr,
-    SortOrder, Statement,
+    aggregate_label, AggregateFunc, AggregateTarget, CompareOp, FilterExpr, JoinClause,
+    OrderByClause, SelectExpr, SortOrder, Statement,
 };
 use crate::error::{FluxError, Result};
 use crate::parser::parse_script;
 use crate::security::{AuditLogger, CryptoManager, Identity, statement_action};
 use crate::storage::Storage;
-use crate::types::{ColumnSchema, Constraint, DataType, Row, TableSchema, Value};
+use crate::types::{ColumnSchema, Constraint, DataType, Row, RowLocator, TableSchema, Value};
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
@@ -107,12 +107,16 @@ impl Engine {
             Statement::Select {
                 table,
                 columns,
-                join,
+                joins,
                 filter,
+                group_by,
+                having,
                 order_by,
                 limit,
                 offset,
-            } => self.select(table, columns, join, filter, order_by, limit, offset),
+            } => self.select(
+                table, columns, joins, filter, group_by, having, order_by, limit, offset,
+            ),
             Statement::Delete { table, filter } => self.delete(table, filter),
             Statement::Begin => self.begin_transaction(),
             Statement::Commit => self.commit_transaction(),
@@ -166,6 +170,12 @@ impl Engine {
                     crate::ast::ColumnConstraint::PrimaryKey => Constraint::PrimaryKey,
                     crate::ast::ColumnConstraint::NotNull => Constraint::NotNull,
                     crate::ast::ColumnConstraint::Unique => Constraint::Unique,
+                    crate::ast::ColumnConstraint::References { table, column } => {
+                        Constraint::References {
+                            table: table.clone(),
+                            column: column.clone(),
+                        }
+                    }
                 })
                 .collect();
             if constraints.contains(&Constraint::PrimaryKey) {
@@ -183,6 +193,47 @@ impl Engine {
             });
         }
 
+        for col in &schema_columns {
+            for constraint in &col.constraints {
+                if let Constraint::References {
+                    table: parent_table,
+                    column: parent_column,
+                } = constraint
+                {
+                    let (parent_col_type, parent_exists) = if *parent_table == table_name {
+                        let found = schema_columns
+                            .iter()
+                            .find(|c| c.name == *parent_column)
+                            .map(|c| c.data_type.clone());
+                        (found.clone(), found.is_some())
+                    } else {
+                        match self.storage.get_schema(parent_table) {
+                            Ok(parent) => {
+                                let found = parent
+                                    .columns
+                                    .iter()
+                                    .find(|c| c.name == *parent_column)
+                                    .map(|c| c.data_type.clone());
+                                (found.clone(), found.is_some())
+                            }
+                            Err(_) => (None, false),
+                        }
+                    };
+                    if !parent_exists {
+                        return Err(FluxError::InvalidSchema(format!(
+                            "REFERENCES target '{parent_table}({parent_column})' does not exist"
+                        )));
+                    }
+                    if parent_col_type != Some(col.data_type.clone()) {
+                        return Err(FluxError::InvalidSchema(format!(
+                            "type of column '{}' does not match referenced column '{parent_table}({parent_column})'",
+                            col.name
+                        )));
+                    }
+                }
+            }
+        }
+
         self.storage.create_table(TableSchema {
             name: table_name.clone(),
             columns: schema_columns,
@@ -195,6 +246,15 @@ impl Engine {
     }
 
     fn drop_table(&mut self, name: String) -> Result<QueryResult> {
+        let referencing = self.referencing_columns(&name)?;
+        if let Some((child_table, child_column, _)) = referencing
+            .iter()
+            .find(|(child_table, _, _)| *child_table != name)
+        {
+            return Err(FluxError::ConstraintViolation(format!(
+                "cannot drop table '{name}': column '{child_table}.{child_column}' references it"
+            )));
+        }
         self.storage.drop_table(&name)?;
         Ok(QueryResult::Message(format!("table '{name}' dropped")))
     }
@@ -231,6 +291,12 @@ impl Engine {
                 crate::ast::ColumnConstraint::PrimaryKey => Constraint::PrimaryKey,
                 crate::ast::ColumnConstraint::NotNull => Constraint::NotNull,
                 crate::ast::ColumnConstraint::Unique => Constraint::Unique,
+                crate::ast::ColumnConstraint::References { table, column } => {
+                    Constraint::References {
+                        table: table.clone(),
+                        column: column.clone(),
+                    }
+                }
             })
             .collect();
         let updated_rows = self.storage.add_column(
@@ -318,7 +384,8 @@ impl Engine {
             }
         }
 
-        check_constraints_for_insert(&self.storage, &table, &schema, &row)?;
+        check_constraints_for_insert(&mut self.storage, &table, &schema, &row)?;
+        self.check_foreign_keys_row(&table, &schema, &row)?;
 
         self.storage.append_row(&table, &row)?;
         Ok(QueryResult::Message("1 row inserted".to_string()))
@@ -331,11 +398,43 @@ impl Engine {
         filter: Option<FilterExpr>,
     ) -> Result<QueryResult> {
         let schema = self.storage.get_schema(&table)?;
+        let filter = match filter {
+            Some(f) => Some(self.resolve_subqueries(f)?),
+            None => None,
+        };
         let prepared_filter = match filter {
             Some(filter) => Some(prepare_filter(&schema, &table, filter)?),
             None => None,
         };
         let prepared_assignments = prepare_assignments(&schema, &table, assignments)?;
+
+        for (col_name, value) in &prepared_assignments {
+            if matches!(value, Value::Null) {
+                continue;
+            }
+            let Some(col_schema) = schema.columns.iter().find(|c| c.name == *col_name) else {
+                continue;
+            };
+            for constraint in &col_schema.constraints {
+                if let Constraint::References {
+                    table: parent_table,
+                    column: parent_column,
+                } = constraint
+                {
+                    let parent_rows = self.storage.read_rows(parent_table)?;
+                    if !parent_rows
+                        .iter()
+                        .any(|pr| pr.get(parent_column) == Some(value))
+                    {
+                        return Err(FluxError::ConstraintViolation(format!(
+                            "foreign key violation: {table}.{col_name} = {value} has no match in {parent_table}.{parent_column}"
+                        )));
+                    }
+                }
+            }
+        }
+
+        self.check_referencing_children_on_update(&table, &prepared_assignments, prepared_filter.as_ref())?;
 
         check_unique_constraints_for_update(
             &self.storage,
@@ -374,69 +473,93 @@ impl Engine {
         Ok(QueryResult::Message(format!("{updated} rows updated")))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn select(
         &self,
         table: String,
         columns: Vec<SelectExpr>,
-        join: Option<JoinClause>,
+        joins: Vec<JoinClause>,
         filter: Option<FilterExpr>,
+        group_by: Vec<String>,
+        having: Option<FilterExpr>,
         order_by: Vec<OrderByClause>,
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<QueryResult> {
         let schema = self.storage.get_schema(&table)?;
 
+        let filter = match filter {
+            Some(f) => Some(self.resolve_subqueries(f)?),
+            None => None,
+        };
+
         let has_aggregates = columns.iter().any(|c| matches!(c, SelectExpr::Aggregate { .. }));
 
-        let (rows, effective_schema) = if let Some(ref join_clause) = join {
-            let right_schema = self.storage.get_schema(&join_clause.table)?;
-            let left_rows = self.storage.read_rows(&table)?;
-            let right_rows = self.storage.read_rows(&join_clause.table)?;
-
+        let (rows, effective_schema) = if !joins.is_empty() {
+            let mut current_rows = self.storage.read_rows(&table)?;
             let mut merged_columns: Vec<ColumnSchema> = schema.columns.clone();
-            for rc in &right_schema.columns {
-                let name = if merged_columns.iter().any(|c| c.name == rc.name) {
-                    format!("{}_{}", join_clause.table, rc.name)
-                } else {
-                    rc.name.clone()
-                };
-                merged_columns.push(ColumnSchema {
-                    name,
-                    data_type: rc.data_type.clone(),
-                    constraints: rc.constraints.clone(),
-                });
-            }
-
-            let mut right_buckets: std::collections::HashMap<String, Vec<&Row>> =
+            let mut name_map: std::collections::HashMap<(String, String), String> =
                 std::collections::HashMap::new();
-            for rr in &right_rows {
-                let key = right_join_key(rr.get(&join_clause.right_column))?;
-                right_buckets.entry(key).or_default().push(rr);
+            for col in &schema.columns {
+                name_map.insert((table.clone(), col.name.clone()), col.name.clone());
             }
 
-            let mut joined = Vec::new();
-            for lr in &left_rows {
-                let left_key = right_join_key(lr.get(&join_clause.left_column))?;
-                let Some(matches) = right_buckets.get(&left_key) else {
-                    continue;
+            for join_clause in &joins {
+                let right_schema = self.storage.get_schema(&join_clause.table)?;
+                let right_rows = self.storage.read_rows(&join_clause.table)?;
+
+                let mut right_names = Vec::new();
+                for rc in &right_schema.columns {
+                    let name = if merged_columns.iter().any(|c| c.name == rc.name) {
+                        format!("{}_{}", join_clause.table, rc.name)
+                    } else {
+                        rc.name.clone()
+                    };
+                    right_names.push((rc.name.clone(), name.clone()));
+                    name_map.insert(
+                        (join_clause.table.clone(), rc.name.clone()),
+                        name.clone(),
+                    );
+                    merged_columns.push(ColumnSchema {
+                        name,
+                        data_type: rc.data_type.clone(),
+                        constraints: rc.constraints.clone(),
+                    });
+                }
+
+                let mut right_buckets: std::collections::HashMap<String, Vec<&Row>> =
+                    std::collections::HashMap::new();
+                for rr in &right_rows {
+                    let key = right_join_key(rr.get(&join_clause.right_column))?;
+                    right_buckets.entry(key).or_default().push(rr);
+                }
+
+                let left_lookup = match &join_clause.left_table {
+                    Some(qualifier) => name_map
+                        .get(&(qualifier.clone(), join_clause.left_column.clone()))
+                        .cloned()
+                        .unwrap_or_else(|| join_clause.left_column.clone()),
+                    None => join_clause.left_column.clone(),
                 };
-                for rr in matches {
-                    {
+
+                let mut joined = Vec::new();
+                for lr in &current_rows {
+                    let left_key = right_join_key(lr.get(&left_lookup))?;
+                    let Some(matches) = right_buckets.get(&left_key) else {
+                        continue;
+                    };
+                    for rr in matches {
                         let mut merged = lr.clone();
-                        for rc in &right_schema.columns {
-                            let key = if lr.contains_key(&rc.name) {
-                                format!("{}_{}", join_clause.table, rc.name)
-                            } else {
-                                rc.name.clone()
-                            };
+                        for (original, renamed) in &right_names {
                             merged.insert(
-                                key,
-                                rr.get(&rc.name).cloned().unwrap_or(Value::Null),
+                                renamed.clone(),
+                                rr.get(original).cloned().unwrap_or(Value::Null),
                             );
                         }
                         joined.push(merged);
                     }
                 }
+                current_rows = joined;
             }
 
             let eff = TableSchema {
@@ -444,7 +567,7 @@ impl Engine {
                 columns: merged_columns,
                 next_row_id: 0,
             };
-            (joined, eff)
+            (current_rows, eff)
         } else {
             let prepared_filter = match &filter {
                 Some(f) => Some(prepare_filter(&schema, &table, f.clone())?),
@@ -467,34 +590,42 @@ impl Engine {
             .filter(|row| row_matches_filter(row, prepared_filter.as_ref()))
             .collect();
 
-        if has_aggregates {
-            return self.execute_aggregate(&columns, &effective_schema, &table, &filtered);
-        }
-
-        let projected_columns = resolve_select_columns(&effective_schema, &table, &columns)?;
-
-        let mut result_rows: Vec<Vec<Value>> = filtered
-            .iter()
-            .map(|row| {
-                projected_columns
-                    .iter()
-                    .map(|col| row.get(col).cloned().unwrap_or(Value::Null))
-                    .collect()
-            })
-            .collect();
+        let (out_columns, mut result_rows) = if !group_by.is_empty() {
+            compute_group_by(
+                &columns,
+                &effective_schema,
+                &table,
+                &filtered,
+                &group_by,
+                having.as_ref(),
+            )?
+        } else if has_aggregates {
+            self.execute_aggregate(&columns, &effective_schema, &table, &filtered)?
+        } else {
+            if having.is_some() {
+                return Err(FluxError::Parse("HAVING requires GROUP BY".to_string()));
+            }
+            let projected_columns = resolve_select_columns(&effective_schema, &table, &columns)?;
+            let rows: Vec<Vec<Value>> = filtered
+                .iter()
+                .map(|row| {
+                    projected_columns
+                        .iter()
+                        .map(|col| row.get(col).cloned().unwrap_or(Value::Null))
+                        .collect()
+                })
+                .collect();
+            (projected_columns, rows)
+        };
 
         if !order_by.is_empty() {
             let order_indices: Vec<(usize, bool)> = order_by
                 .iter()
                 .filter_map(|ob| {
-                    projected_columns.iter().position(|c| *c == ob.column).map(
-                        |idx| {
-                            (
-                                idx,
-                                matches!(ob.order, SortOrder::Asc),
-                            )
-                        },
-                    )
+                    out_columns
+                        .iter()
+                        .position(|c| *c == ob.column)
+                        .map(|idx| (idx, matches!(ob.order, SortOrder::Asc)))
                 })
                 .collect();
 
@@ -518,9 +649,73 @@ impl Engine {
             .collect();
 
         Ok(QueryResult::Rows {
-            columns: projected_columns,
+            columns: out_columns,
             rows: result_rows,
         })
+    }
+
+    fn resolve_subqueries(&self, filter: FilterExpr) -> Result<FilterExpr> {
+        match filter {
+            FilterExpr::InSubquery {
+                column,
+                subquery,
+                negated,
+            } => {
+                let Statement::Select {
+                    table,
+                    columns,
+                    joins,
+                    filter,
+                    group_by,
+                    having,
+                    order_by,
+                    limit,
+                    offset,
+                } = *subquery
+                else {
+                    return Err(FluxError::Parse(
+                        "only SELECT is allowed as a subquery".to_string(),
+                    ));
+                };
+                let result = self.select(
+                    table, columns, joins, filter, group_by, having, order_by, limit, offset,
+                )?;
+                let QueryResult::Rows { columns, rows } = result else {
+                    return Err(FluxError::Parse(
+                        "subquery did not produce rows".to_string(),
+                    ));
+                };
+                if columns.len() != 1 {
+                    return Err(FluxError::Parse(
+                        "subquery must return exactly one column".to_string(),
+                    ));
+                }
+                let values = rows
+                    .into_iter()
+                    .filter_map(|mut row| {
+                        if row.is_empty() {
+                            None
+                        } else {
+                            Some(row.remove(0))
+                        }
+                    })
+                    .collect();
+                Ok(FilterExpr::InList {
+                    column,
+                    values,
+                    negated,
+                })
+            }
+            FilterExpr::And(left, right) => Ok(FilterExpr::And(
+                Box::new(self.resolve_subqueries(*left)?),
+                Box::new(self.resolve_subqueries(*right)?),
+            )),
+            FilterExpr::Or(left, right) => Ok(FilterExpr::Or(
+                Box::new(self.resolve_subqueries(*left)?),
+                Box::new(self.resolve_subqueries(*right)?),
+            )),
+            other => Ok(other),
+        }
     }
 
     fn execute_aggregate(
@@ -529,17 +724,14 @@ impl Engine {
         schema: &TableSchema,
         table: &str,
         rows: &[Row],
-    ) -> Result<QueryResult> {
+    ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
         let mut col_names = Vec::new();
         let mut result_values = Vec::new();
 
         for expr in select_exprs {
             match expr {
                 SelectExpr::Aggregate { func, target } => {
-                    let col_label = match (func, target) {
-                        (f, AggregateTarget::Star) => format!("{}(*)", agg_name(f)),
-                        (f, AggregateTarget::Column(c)) => format!("{}({})", agg_name(f), c),
-                    };
+                    let col_label = aggregate_label(func, target);
 
                     if let AggregateTarget::Column(col) = target {
                         if !schema.columns.iter().any(|c| c.name == *col) {
@@ -576,18 +768,53 @@ impl Engine {
             }
         }
 
-        Ok(QueryResult::Rows {
-            columns: col_names,
-            rows: vec![result_values],
-        })
+        Ok((col_names, vec![result_values]))
     }
 
     fn delete(&mut self, table: String, filter: Option<FilterExpr>) -> Result<QueryResult> {
         let schema = self.storage.get_schema(&table)?;
+        let filter = match filter {
+            Some(f) => Some(self.resolve_subqueries(f)?),
+            None => None,
+        };
         let prepared_filter = match filter {
             Some(filter) => Some(prepare_filter(&schema, &table, filter)?),
             None => None,
         };
+
+        let referencing = self.referencing_columns(&table)?;
+        if !referencing.is_empty() {
+            let rows = self.storage.read_rows(&table)?;
+            for (child_table, child_column, parent_column) in &referencing {
+                let child_rows = self.storage.read_rows(child_table)?;
+                for doomed in rows
+                    .iter()
+                    .filter(|r| row_matches_filter(r, prepared_filter.as_ref()))
+                {
+                    let Some(value) = doomed.get(parent_column) else {
+                        continue;
+                    };
+                    if matches!(value, Value::Null) {
+                        continue;
+                    }
+                    let survives = rows.iter().any(|r| {
+                        !row_matches_filter(r, prepared_filter.as_ref())
+                            && r.get(parent_column) == Some(value)
+                    });
+                    if survives {
+                        continue;
+                    }
+                    if child_rows
+                        .iter()
+                        .any(|cr| cr.get(child_column) == Some(value))
+                    {
+                        return Err(FluxError::ConstraintViolation(format!(
+                            "foreign key violation: rows in '{child_table}' reference {table}.{parent_column} = {value}"
+                        )));
+                    }
+                }
+            }
+        }
 
         let mut deleted = 0usize;
         self.storage.rewrite_rows(&table, |row| {
@@ -672,15 +899,104 @@ impl Engine {
             rows,
         })
     }
+
+    fn check_foreign_keys_row(&self, table: &str, schema: &TableSchema, row: &Row) -> Result<()> {
+        for col in &schema.columns {
+            for constraint in &col.constraints {
+                if let Constraint::References {
+                    table: parent_table,
+                    column: parent_column,
+                } = constraint
+                {
+                    let value = row.get(&col.name).unwrap_or(&Value::Null);
+                    if matches!(value, Value::Null) {
+                        continue;
+                    }
+                    let parent_rows = self.storage.read_rows(parent_table)?;
+                    if !parent_rows
+                        .iter()
+                        .any(|pr| pr.get(parent_column) == Some(value))
+                    {
+                        return Err(FluxError::ConstraintViolation(format!(
+                            "foreign key violation: {table}.{} = {value} has no match in {parent_table}.{parent_column}",
+                            col.name
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn referencing_columns(&self, parent: &str) -> Result<Vec<(String, String, String)>> {
+        let mut out = Vec::new();
+        for table in self.storage.list_tables() {
+            let schema = self.storage.get_schema(&table)?;
+            for col in &schema.columns {
+                for constraint in &col.constraints {
+                    if let Constraint::References {
+                        table: ref_table,
+                        column: ref_column,
+                    } = constraint
+                    {
+                        if ref_table == parent {
+                            out.push((table.clone(), col.name.clone(), ref_column.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn check_referencing_children_on_update(
+        &self,
+        table: &str,
+        assignments: &[(String, Value)],
+        filter: Option<&FilterExpr>,
+    ) -> Result<()> {
+        let referencing = self.referencing_columns(table)?;
+        if referencing.is_empty() {
+            return Ok(());
+        }
+        let rows = self.storage.read_rows(table)?;
+        for (child_table, child_column, parent_column) in &referencing {
+            let Some((_, new_value)) = assignments
+                .iter()
+                .find(|(name, _)| name == parent_column)
+            else {
+                continue;
+            };
+            let child_rows = self.storage.read_rows(child_table)?;
+            for row in rows.iter().filter(|r| row_matches_filter(r, filter)) {
+                let Some(old_value) = row.get(parent_column) else {
+                    continue;
+                };
+                if matches!(old_value, Value::Null) || old_value == new_value {
+                    continue;
+                }
+                if child_rows
+                    .iter()
+                    .any(|cr| cr.get(child_column) == Some(old_value))
+                {
+                    return Err(FluxError::ConstraintViolation(format!(
+                        "foreign key violation: rows in '{child_table}' reference {table}.{parent_column} = {old_value}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
-
 fn check_constraints_for_insert(
-    storage: &Storage,
+    storage: &mut Storage,
     table: &str,
     schema: &TableSchema,
     row: &Row,
 ) -> Result<()> {
+    let mut unique_columns = Vec::new();
+
     for col_schema in &schema.columns {
         let value = row.get(&col_schema.name).unwrap_or(&Value::Null);
 
@@ -693,29 +1009,29 @@ fn check_constraints_for_insert(
                     col_schema.name
                 )));
             }
+            continue;
         }
 
         if col_schema.constraints.contains(&Constraint::Unique)
             || col_schema.constraints.contains(&Constraint::PrimaryKey)
         {
-            if !matches!(value, Value::Null) {
-                let existing = storage.read_rows(table)?;
-                for existing_row in &existing {
-                    if let Some(existing_val) = existing_row.get(&col_schema.name) {
-                        if existing_val == value {
-                            return Err(FluxError::ConstraintViolation(format!(
-                                "duplicate value for column '{}': {}",
-                                col_schema.name, value
-                            )));
-                        }
-                    }
-                }
-            }
+            unique_columns.push((col_schema.name.as_str(), value));
+        }
+    }
+
+    if unique_columns.is_empty() {
+        return Ok(());
+    }
+
+    for (column, value) in unique_columns {
+        if storage.unique_value_exists(table, column, value)? {
+            return Err(FluxError::ConstraintViolation(format!(
+                "duplicate value for column '{column}': {value}"
+            )));
         }
     }
     Ok(())
 }
-
 
 fn check_unique_constraints_for_update(
     storage: &Storage,
@@ -774,14 +1090,159 @@ fn right_join_key(value: Option<&Value>) -> Result<String> {
     index_value_key_for(value.unwrap_or(&Value::Null))
 }
 
-fn agg_name(func: &AggregateFunc) -> &'static str {
-    match func {
-        AggregateFunc::Count => "COUNT",
-        AggregateFunc::Sum => "SUM",
-        AggregateFunc::Min => "MIN",
-        AggregateFunc::Max => "MAX",
-        AggregateFunc::Avg => "AVG",
+fn compute_group_by(
+    select_exprs: &[SelectExpr],
+    schema: &TableSchema,
+    table: &str,
+    rows: &[Row],
+    group_by: &[String],
+    having: Option<&FilterExpr>,
+) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    for col in group_by {
+        if !schema.columns.iter().any(|c| c.name == *col) {
+            return Err(FluxError::ColumnNotFound {
+                table: table.to_string(),
+                column: col.clone(),
+            });
+        }
     }
+    for expr in select_exprs {
+        match expr {
+            SelectExpr::AllColumns => {
+                return Err(FluxError::Parse(
+                    "cannot use * with GROUP BY".to_string(),
+                ));
+            }
+            SelectExpr::Column(name) => {
+                if !group_by.contains(name) {
+                    return Err(FluxError::Parse(format!(
+                        "column '{name}' must appear in GROUP BY or an aggregate function"
+                    )));
+                }
+            }
+            SelectExpr::Aggregate {
+                target: AggregateTarget::Column(col),
+                ..
+            } => {
+                if !schema.columns.iter().any(|c| c.name == *col) {
+                    return Err(FluxError::ColumnNotFound {
+                        table: table.to_string(),
+                        column: col.clone(),
+                    });
+                }
+            }
+            SelectExpr::Aggregate { .. } => {}
+        }
+    }
+
+    let mut group_order: Vec<Vec<String>> = Vec::new();
+    let mut groups: std::collections::HashMap<Vec<String>, Vec<Row>> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let mut key = Vec::with_capacity(group_by.len());
+        for col in group_by {
+            key.push(index_value_key_for(row.get(col).unwrap_or(&Value::Null))?);
+        }
+        if !groups.contains_key(&key) {
+            group_order.push(key.clone());
+        }
+        groups.entry(key).or_default().push(row.clone());
+    }
+
+    let having_aggregates = having.map(collect_having_aggregates).unwrap_or_default();
+
+    let mut out_columns = Vec::new();
+    for expr in select_exprs {
+        match expr {
+            SelectExpr::Column(name) => out_columns.push(name.clone()),
+            SelectExpr::Aggregate { func, target } => {
+                out_columns.push(aggregate_label(func, target));
+            }
+            SelectExpr::AllColumns => unreachable!(),
+        }
+    }
+
+    let mut result_rows = Vec::new();
+    for key in group_order {
+        let group_rows = &groups[&key];
+        let sample = &group_rows[0];
+
+        if let Some(having_expr) = having {
+            let mut synthetic = sample.clone();
+            for (label, func, target) in &having_aggregates {
+                synthetic.insert(label.clone(), compute_aggregate(func, target, group_rows)?);
+            }
+            if !evaluate_filter(&synthetic, having_expr) {
+                continue;
+            }
+        }
+
+        let mut out_row = Vec::with_capacity(select_exprs.len());
+        for expr in select_exprs {
+            match expr {
+                SelectExpr::Column(name) => {
+                    out_row.push(sample.get(name).cloned().unwrap_or(Value::Null));
+                }
+                SelectExpr::Aggregate { func, target } => {
+                    out_row.push(compute_aggregate(func, target, group_rows)?);
+                }
+                SelectExpr::AllColumns => unreachable!(),
+            }
+        }
+        result_rows.push(out_row);
+    }
+
+    Ok((out_columns, result_rows))
+}
+
+fn collect_having_aggregates(
+    having: &FilterExpr,
+) -> Vec<(String, AggregateFunc, AggregateTarget)> {
+    let mut out = Vec::new();
+    collect_having_aggregates_inner(having, &mut out);
+    out
+}
+
+fn collect_having_aggregates_inner(
+    filter: &FilterExpr,
+    out: &mut Vec<(String, AggregateFunc, AggregateTarget)>,
+) {
+    match filter {
+        FilterExpr::Compare { column, .. } => {
+            if let Some((func, target)) = parse_aggregate_label(column) {
+                if !out.iter().any(|(label, _, _)| label == column) {
+                    out.push((column.clone(), func, target));
+                }
+            }
+        }
+        FilterExpr::And(left, right) | FilterExpr::Or(left, right) => {
+            collect_having_aggregates_inner(left, out);
+            collect_having_aggregates_inner(right, out);
+        }
+        _ => {}
+    }
+}
+
+fn parse_aggregate_label(label: &str) -> Option<(AggregateFunc, AggregateTarget)> {
+    let open = label.find('(')?;
+    if !label.ends_with(')') {
+        return None;
+    }
+    let func = match label[..open].to_ascii_uppercase().as_str() {
+        "COUNT" => AggregateFunc::Count,
+        "SUM" => AggregateFunc::Sum,
+        "MIN" => AggregateFunc::Min,
+        "MAX" => AggregateFunc::Max,
+        "AVG" => AggregateFunc::Avg,
+        _ => return None,
+    };
+    let inner = label[open + 1..label.len() - 1].trim();
+    let target = if inner == "*" {
+        AggregateTarget::Star
+    } else {
+        AggregateTarget::Column(inner.to_string())
+    };
+    Some((func, target))
 }
 
 fn compute_aggregate(func: &AggregateFunc, target: &AggregateTarget, rows: &[Row]) -> Result<Value> {
@@ -887,7 +1348,6 @@ fn agg_column<'a>(target: &'a AggregateTarget) -> Result<&'a str> {
         )),
     }
 }
-
 
 fn resolve_select_columns(
     schema: &TableSchema,
@@ -1014,6 +1474,33 @@ fn prepare_filter(schema: &TableSchema, table: &str, filter: FilterExpr) -> Resu
             }
             Ok(FilterExpr::IsNotNull { column })
         }
+        FilterExpr::InList {
+            column,
+            values,
+            negated,
+        } => {
+            let expected_type = schema
+                .columns
+                .iter()
+                .find(|candidate| candidate.name == column)
+                .map(|candidate| candidate.data_type.clone())
+                .ok_or_else(|| FluxError::ColumnNotFound {
+                    table: table.to_string(),
+                    column: column.clone(),
+                })?;
+            let values = values
+                .into_iter()
+                .map(|value| coerce_value(&column, &expected_type, value))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(FilterExpr::InList {
+                column,
+                values,
+                negated,
+            })
+        }
+        FilterExpr::InSubquery { .. } => Err(FluxError::Parse(
+            "unresolved subquery in filter".to_string(),
+        )),
         FilterExpr::And(left, right) => Ok(FilterExpr::And(
             Box::new(prepare_filter(schema, table, *left)?),
             Box::new(prepare_filter(schema, table, *right)?),
@@ -1044,6 +1531,23 @@ fn evaluate_filter(row: &Row, filter: &FilterExpr) -> bool {
         FilterExpr::IsNotNull { column } => {
             matches!(row.get(column), Some(v) if !matches!(v, Value::Null))
         }
+        FilterExpr::InList {
+            column,
+            values,
+            negated,
+        } => {
+            let left = row.get(column).unwrap_or(&Value::Null);
+            if matches!(left, Value::Null) {
+                return false;
+            }
+            let contains = values.iter().any(|v| v == left);
+            if *negated {
+                !contains
+            } else {
+                contains
+            }
+        }
+        FilterExpr::InSubquery { .. } => false,
         FilterExpr::And(left, right) => evaluate_filter(row, left) && evaluate_filter(row, right),
         FilterExpr::Or(left, right) => evaluate_filter(row, left) || evaluate_filter(row, right),
     }
@@ -1104,20 +1608,20 @@ fn find_best_index_candidate(
     storage: &Storage,
     table: &str,
     filter: Option<&FilterExpr>,
-) -> Result<Option<Vec<u64>>> {
+) -> Result<Option<Vec<RowLocator>>> {
     let Some(filter) = filter else {
         return Ok(None);
     };
     let mut candidates = Vec::new();
     collect_index_candidates(filter, &mut candidates);
-    let mut best: Option<Vec<u64>> = None;
+    let mut best: Option<Vec<RowLocator>> = None;
     for (column, value) in candidates {
-        if let Some(ids) = storage.find_indexed_row_ids(table, &column, &value)? {
+        if let Some(locators) = storage.find_indexed_locators(table, &column, &value)? {
             if best
                 .as_ref()
-                .is_none_or(|existing| ids.len() < existing.len())
+                .is_none_or(|existing| locators.len() < existing.len())
             {
-                best = Some(ids);
+                best = Some(locators);
             }
         }
     }
@@ -1135,7 +1639,11 @@ fn collect_index_candidates(filter: &FilterExpr, out: &mut Vec<(String, Value)>)
             collect_index_candidates(left, out);
             collect_index_candidates(right, out);
         }
-        FilterExpr::Or(_, _) | FilterExpr::IsNull { .. } | FilterExpr::IsNotNull { .. } => {}
+        FilterExpr::Or(_, _)
+        | FilterExpr::IsNull { .. }
+        | FilterExpr::IsNotNull { .. }
+        | FilterExpr::InList { .. }
+        | FilterExpr::InSubquery { .. } => {}
     }
 }
 
@@ -1411,6 +1919,63 @@ mod tests {
     }
 
     #[test]
+    fn unique_value_reusable_after_delete() {
+        let (mut engine, _tmp) = test_engine();
+        engine
+            .execute_script(
+                "CREATE TABLE t (id INT PRIMARY KEY, name TEXT UNIQUE);
+                 INSERT INTO t VALUES (1, 'Alice');
+                 INSERT INTO t VALUES (2, 'Bob');",
+            )
+            .expect("setup");
+
+        assert!(engine
+            .execute_script("INSERT INTO t VALUES (1, 'Carol');")
+            .is_err());
+
+        engine
+            .execute_script("DELETE FROM t WHERE id = 1;")
+            .expect("delete");
+
+        engine
+            .execute_script("INSERT INTO t VALUES (1, 'Alice');")
+            .expect("reinserting a freed unique value should succeed");
+
+        let result = engine
+            .execute_script("SELECT COUNT(*) FROM t;")
+            .expect("count");
+        let QueryResult::Rows { rows, .. } = &result[0] else {
+            panic!("expected rows");
+        };
+        assert_eq!(rows[0][0], Value::Int(2));
+
+        assert!(engine
+            .execute_script("INSERT INTO t VALUES (2, 'Dave');")
+            .is_err());
+    }
+
+    #[test]
+    fn unique_constraint_survives_rollback() {
+        let (mut engine, _tmp) = test_engine();
+        engine
+            .execute_script(
+                "CREATE TABLE t (id INT PRIMARY KEY);
+                 INSERT INTO t VALUES (1);
+                 BEGIN;
+                 INSERT INTO t VALUES (2);
+                 ROLLBACK;",
+            )
+            .expect("setup");
+
+        engine
+            .execute_script("INSERT INTO t VALUES (2);")
+            .expect("id freed by rollback should be insertable");
+        assert!(engine
+            .execute_script("INSERT INTO t VALUES (1);")
+            .is_err());
+    }
+
+    #[test]
     fn update_allows_keeping_own_unique_value() {
         let (mut engine, _tmp) = test_engine();
         engine
@@ -1628,6 +2193,248 @@ mod tests {
             .expect("setup");
 
         for (id, name) in [(2, "B"), (3, "C")] {
+            let result = engine
+                .execute_script(&format!("SELECT id, name FROM t WHERE id = {id};"))
+                .expect("select");
+            let QueryResult::Rows { rows, .. } = &result[0] else {
+                panic!("expected rows");
+            };
+            assert_eq!(
+                rows,
+                &vec![vec![Value::Int(id), Value::Text(name.to_string())]]
+            );
+        }
+    }
+
+    #[test]
+    fn multi_join_three_tables() {
+        let (mut engine, _tmp) = test_engine();
+        engine
+            .execute_script(
+                "CREATE TABLE users (id INT, name TEXT);
+                 CREATE TABLE orders (id INT, user_id INT);
+                 CREATE TABLE items (id INT, order_id INT, product TEXT);
+                 INSERT INTO users VALUES (1, 'Alice');
+                 INSERT INTO orders VALUES (10, 1);
+                 INSERT INTO items VALUES (100, 10, 'Widget');
+                 INSERT INTO items VALUES (101, 10, 'Gizmo');",
+            )
+            .expect("setup");
+
+        let result = engine
+            .execute_script(
+                "SELECT name, product FROM users \
+                 JOIN orders ON users.id = orders.user_id \
+                 JOIN items ON orders.id = items.order_id;",
+            )
+            .expect("multi join");
+        let QueryResult::Rows { rows, .. } = &result[0] else {
+            panic!("expected rows");
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Value::Text("Alice".into()));
+    }
+
+    #[test]
+    fn group_by_with_having() {
+        let (mut engine, _tmp) = test_engine();
+        engine
+            .execute_script(
+                "CREATE TABLE orders (id INT, user_id INT, amount INT);
+                 INSERT INTO orders VALUES (1, 1, 10);
+                 INSERT INTO orders VALUES (2, 1, 20);
+                 INSERT INTO orders VALUES (3, 2, 5);",
+            )
+            .expect("setup");
+
+        let result = engine
+            .execute_script(
+                "SELECT user_id, COUNT(*), SUM(amount) FROM orders GROUP BY user_id;",
+            )
+            .expect("group by");
+        let QueryResult::Rows { columns, rows } = &result[0] else {
+            panic!("expected rows");
+        };
+        assert_eq!(
+            columns,
+            &vec![
+                "user_id".to_string(),
+                "COUNT(*)".to_string(),
+                "SUM(amount)".to_string()
+            ]
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec![Value::Int(1), Value::Int(2), Value::Int(30)]);
+        assert_eq!(rows[1], vec![Value::Int(2), Value::Int(1), Value::Int(5)]);
+
+        let result = engine
+            .execute_script(
+                "SELECT user_id, COUNT(*) FROM orders GROUP BY user_id HAVING COUNT(*) > 1;",
+            )
+            .expect("having");
+        let QueryResult::Rows { rows, .. } = &result[0] else {
+            panic!("expected rows");
+        };
+        assert_eq!(rows, &vec![vec![Value::Int(1), Value::Int(2)]]);
+    }
+
+    #[test]
+    fn in_list_and_subquery() {
+        let (mut engine, _tmp) = test_engine();
+        engine
+            .execute_script(
+                "CREATE TABLE users (id INT, name TEXT);
+                 CREATE TABLE banned (user_id INT);
+                 INSERT INTO users VALUES (1, 'Alice');
+                 INSERT INTO users VALUES (2, 'Bob');
+                 INSERT INTO users VALUES (3, 'Carol');
+                 INSERT INTO banned VALUES (2);",
+            )
+            .expect("setup");
+
+        let result = engine
+            .execute_script("SELECT name FROM users WHERE id IN (1, 3);")
+            .expect("in list");
+        let QueryResult::Rows { rows, .. } = &result[0] else {
+            panic!("expected rows");
+        };
+        assert_eq!(rows.len(), 2);
+
+        let result = engine
+            .execute_script(
+                "SELECT name FROM users WHERE id NOT IN (SELECT user_id FROM banned);",
+            )
+            .expect("not in subquery");
+        let QueryResult::Rows { rows, .. } = &result[0] else {
+            panic!("expected rows");
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Value::Text("Alice".into()));
+        assert_eq!(rows[1][0], Value::Text("Carol".into()));
+    }
+
+    #[test]
+    fn foreign_key_enforcement() {
+        let (mut engine, _tmp) = test_engine();
+        engine
+            .execute_script(
+                "CREATE TABLE users (id INT PRIMARY KEY, name TEXT);
+                 CREATE TABLE orders (id INT PRIMARY KEY, user_id INT REFERENCES users(id));
+                 INSERT INTO users VALUES (1, 'Alice');
+                 INSERT INTO orders VALUES (10, 1);",
+            )
+            .expect("setup");
+
+        let err = engine
+            .execute_script("INSERT INTO orders VALUES (11, 99);")
+            .unwrap_err();
+        assert!(err.to_string().contains("foreign key"));
+
+        let err = engine
+            .execute_script("DELETE FROM users WHERE id = 1;")
+            .unwrap_err();
+        assert!(err.to_string().contains("foreign key"));
+
+        let err = engine.execute_script("DROP TABLE users;").unwrap_err();
+        assert!(err.to_string().contains("references"));
+
+        let err = engine
+            .execute_script("UPDATE users SET id = 5 WHERE id = 1;")
+            .unwrap_err();
+        assert!(err.to_string().contains("foreign key"));
+
+        engine
+            .execute_script(
+                "DELETE FROM orders WHERE id = 10;
+                 DELETE FROM users WHERE id = 1;
+                 DROP TABLE orders;
+                 DROP TABLE users;",
+            )
+            .expect("cleanup after removing children");
+    }
+
+    #[test]
+    fn foreign_key_rejects_missing_parent_table() {
+        let (mut engine, _tmp) = test_engine();
+        let err = engine
+            .execute_script("CREATE TABLE orders (id INT, user_id INT REFERENCES users(id));")
+            .unwrap_err();
+        assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn stale_index_is_rebuilt_after_unclean_shutdown() {
+        let temp = tempdir().expect("tempdir");
+        let key = CryptoManager::generate_base64_key();
+        let open_engine = |path: &std::path::Path| {
+            let crypto = CryptoManager::from_base64_key(&key).expect("key parse");
+            let audit = AuditLogger::open(path).expect("audit open");
+            let identity = Identity {
+                username: "test_admin".to_string(),
+                role: Role::Admin,
+            };
+            Engine::open(path, crypto, identity, audit).expect("engine open")
+        };
+
+        {
+            let mut engine = open_engine(temp.path());
+            engine
+                .execute_script(
+                    "CREATE TABLE t (id INT);
+                     CREATE INDEX idx ON t(id);
+                     INSERT INTO t VALUES (1);",
+                )
+                .expect("setup");
+        }
+
+        let index_file = temp.path().join("index_idx.enc");
+        let marker = temp.path().join("indexes.clean");
+        assert!(marker.exists(), "clean shutdown should leave the marker");
+        let stale_index = std::fs::read(&index_file).expect("read index");
+
+        {
+            let mut engine = open_engine(temp.path());
+            engine
+                .execute_script("INSERT INTO t VALUES (2);")
+                .expect("second insert");
+        }
+
+        std::fs::write(&index_file, &stale_index).expect("restore stale index");
+        std::fs::remove_file(&marker).expect("remove marker");
+
+        let mut engine = open_engine(temp.path());
+        let result = engine
+            .execute_script("SELECT id FROM t WHERE id = 2;")
+            .expect("select");
+        let QueryResult::Rows { rows, .. } = &result[0] else {
+            panic!("expected rows");
+        };
+        assert_eq!(
+            rows,
+            &vec![vec![Value::Int(2)]],
+            "index should have been rebuilt from the table data"
+        );
+    }
+
+    #[test]
+    fn indexed_query_correct_after_row_length_changes() {
+        let (mut engine, _tmp) = test_engine();
+        engine
+            .execute_script(
+                "CREATE TABLE t (id INT, name TEXT);
+                 INSERT INTO t VALUES (1, 'A');
+                 INSERT INTO t VALUES (2, 'BB');
+                 INSERT INTO t VALUES (3, 'CCC');
+                 CREATE INDEX idx_t_id ON t(id);
+                 UPDATE t SET name = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' WHERE id = 1;",
+            )
+            .expect("setup");
+
+        for (id, name) in [
+            (1, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            (2, "BB"),
+            (3, "CCC"),
+        ] {
             let result = engine
                 .execute_script(&format!("SELECT id, name FROM t WHERE id = {id};"))
                 .expect("select");
